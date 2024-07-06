@@ -1,0 +1,112 @@
+---
+- name: Update and Restart Docker Compose Projects
+  hosts: rawcsav
+  become: yes
+  vars:
+    github_base_url: "https://github.com/rawcsav"
+    docker_compose_projects:
+      - path: "/home/rawcsav/AIUtilsFlask"
+        repo: "{{ github_base_url }}/NewUtility"
+      - path: "/home/rawcsav/SpotifyFlask"
+        repo: "{{ github_base_url }}/RawcOn"
+      - path: "/home/rawcsav/DockSec"
+        repo: "{{ github_base_url }}/DockSec"
+    discord_webhook_url: "{{ lookup('env', 'DISCORD_WEBHOOK_URL') }}"
+    log_file: "/var/log/docker_compose_update.log"
+
+  tasks:
+    - name: Pull updates and manage Docker Compose projects
+      block:
+        - name: Pull latest updates from GitHub
+          ansible.builtin.git:
+            repo: "{{ item.repo }}"
+            dest: "{{ item.path }}"
+            force: yes
+          register: git_status
+          loop: "{{ docker_compose_projects }}"
+
+        - name: Restart Docker Compose project if updated
+          community.docker.docker_compose_v2:
+            project_src: "{{ item.item.path }}"
+            state: present
+            build: "{{ 'always' if item.changed else 'never' }}"
+            pull: always
+            recreate: always
+          when: item.changed
+          loop: "{{ git_status.results }}"
+          loop_control:
+            label: "{{ item.item.path }}"
+          register: docker_restart_result
+
+        - name: Remove old Docker images and volumes
+          community.docker.docker_prune:
+            images: yes
+            volumes: yes
+            images_filters:
+              dangling: true
+
+      rescue:
+        - name: Capture error details
+          ansible.builtin.set_fact:
+            error_details: "{{ ansible_failed_result }}"
+
+        - name: Log error details
+          ansible.builtin.lineinfile:
+            path: "{{ log_file }}"
+            line: "Error at {{ ansible_date_time.iso8601 }}: {{ error_details | to_json }}"
+            create: yes
+
+        - name: Send Discord notification about error
+          ansible.builtin.uri:
+            url: "{{ discord_webhook_url }}"
+            method: POST
+            body_format: json
+            body:
+              embeds:
+                - title: "Error in Docker Compose Update"
+                  color: 15158332
+                  description: "An error occurred during the update process"
+                  fields:
+                    - name: "Host"
+                      value: "{{ ansible_hostname }}"
+                    - name: "Timestamp"
+                      value: "{{ ansible_date_time.iso8601 }}"
+                    - name: "Error Details"
+                      value: "{{ error_details | to_json }}"
+            status_code: [200, 204]
+          retries: 3
+          delay: 5
+
+      always:
+        - name: Prepare status report
+          ansible.builtin.set_fact:
+            status_report: |
+              Host: {{ ansible_hostname }}
+              {% for result in git_status.results %}
+              Project: {{ result.item.path }}
+                Updated: {{ 'Yes' if result.changed else 'No' }}
+                {% set restart_result = docker_restart_result.results | selectattr('item.item.path', 'equalto', result.item.path) | first %}
+                Restarted: {{ 'Yes' if restart_result.changed | default(false) else 'No' }}
+              {% endfor %}
+
+        - name: Log status report
+          ansible.builtin.lineinfile:
+            path: "{{ log_file }}"
+            line: "Status at {{ ansible_date_time.iso8601 }}: {{ status_report | to_json }}"
+            create: yes
+
+        - name: Send Discord notification about completion
+          ansible.builtin.uri:
+            url: "{{ discord_webhook_url }}"
+            method: POST
+            body_format: json
+            body:
+              embeds:
+                - title: "Docker Compose Update Report"
+                  color: 3066993
+                  description: "{{ status_report }}"
+                  footer:
+                    text: "Update completed at {{ ansible_date_time.iso8601 }}"
+            status_code: [200, 204]
+          retries: 3
+          delay: 5

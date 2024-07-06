@@ -1,0 +1,131 @@
+---
+- name: Update and Upgrade all packages
+  hosts: all
+  become: yes
+  vars:
+    reboot_required: false
+    discord_webhook_url: "{{ lookup('env', 'DISCORD_WEBHOOK_URL') }}"
+
+  tasks:
+    - name: Check if system is Debian-based
+      fail:
+        msg: "This playbook only supports Debian-based systems"
+      when: ansible_os_family != "Debian"
+      tags:
+        - always
+
+    - name: Update apt package list
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+      register: apt_update_result
+      tags:
+        - update
+
+    - name: Upgrade all packages
+      apt:
+        upgrade: dist
+      register: apt_upgrade_result
+      tags:
+        - upgrade
+
+    - name: Check if a reboot is required
+      stat:
+        path: /var/run/reboot-required
+      register: reboot_required_file
+      tags:
+        - reboot_check
+
+    - name: Set reboot_required flag
+      set_fact:
+        reboot_required: "{{ reboot_required_file.stat.exists }}"
+      tags:
+        - reboot_check
+
+    - name: Print upgrade summary
+      debug:
+        msg:
+          - "Packages updated: {{ apt_update_result.changed }}"
+          - "Packages upgraded: {{ apt_upgrade_result.changed }}"
+          - "Reboot required: {{ reboot_required }}"
+      tags:
+        - always
+
+    - name: Reboot the system if required
+      reboot:
+        msg: "Rebooting due to package upgrades"
+        reboot_timeout: 300
+      when: reboot_required
+      tags:
+        - reboot
+
+    - name: Discord with upgrade results
+      block:
+        - uri:
+            url: "{{ discord_webhook_url }}"
+            method: POST
+            body_format: json
+            body:
+              content: |
+                Host: {{ ansible_hostname }}
+                OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
+                Updates: {{ 'Yes' if apt_update_result.changed else 'No' }}
+                Upgrades: {{ 'Yes' if apt_upgrade_result.changed else 'No' }}
+                Reboot needed: {{ 'Yes' if reboot_required else 'No' }}
+                {% if apt_upgrade_result.stdout_lines | length > 0 %}
+                Upgraded packages:
+                {{ apt_upgrade_result.stdout_lines | select('match', '^Upgrading.*') | list | join('\n') }}
+                {% endif %}
+            status_code: [ 200, 204 ]
+          register: discord_notification
+          until: discord_notification is not failed
+          retries: 3
+          delay: 5
+      rescue:
+        - name: Log failure for upgrade notification
+          debug:
+            msg: "Failed to send Discord notification about upgrades for host {{ ansible_hostname }}"
+      always:
+        - name: Ensure playbook continues after upgrade notification
+          debug:
+            msg: "Continuing with next tasks..."
+      when: discord_webhook_url is defined
+      tags:
+        - notify
+
+    - name: Send concise Discord notification about reboot
+      block:
+        - uri:
+            url: "{{ discord_webhook_url }}"
+            method: POST
+            body_format: json
+            body:
+              content: "Host {{ ansible_hostname }} rebooted due to package upgrades at {{ ansible_date_time.iso8601 }}"
+            status_code: [ 200, 204 ]
+          register: discord_reboot_notification
+          until: discord_reboot_notification is not failed
+          retries: 3
+          delay: 5
+      rescue:
+        - name: Log failure for reboot notification
+          debug:
+            msg: "Failed to send Discord notification about reboot for host {{ ansible_hostname }}"
+      always:
+        - name: Ensure playbook continues after reboot notification
+          debug:
+            msg: "Continuing with next tasks..."
+      when:
+        - discord_webhook_url is defined
+        - reboot_required
+      tags:
+        - notify
+        - reboot
+
+  handlers:
+    - name: Restart services
+      service:
+        name: "{{ item }}"
+        state: restarted
+      loop:
+        - ssh
+      when: apt_upgrade_result.changed
