@@ -4,7 +4,15 @@
   become: yes
   vars:
     reboot_required: false
+    perform_reboot: false  # Set to true to allow automatic reboots
     discord_webhook_url: "{{ lookup('env', 'DISCORD_WEBHOOK_URL') }}"
+    log_file: "/var/log/ansible_upgrade.log"
+    excluded_packages:
+      - docker
+      - docker-ce
+      - wireguard
+      - pihole
+      - unbound
 
   tasks:
     - name: Check if system is Debian-based
@@ -14,6 +22,28 @@
       tags:
         - always
 
+    - name: Ensure log directory exists
+      file:
+        path: "{{ log_file | dirname }}"
+        state: directory
+        mode: '0755'
+      tags:
+        - always
+
+    - name: Check available disk space
+      shell: df -h / | awk 'NR==2 {print $4}'
+      register: available_space
+      changed_when: false
+      tags:
+        - pre_check
+
+    - name: Fail if not enough disk space
+      fail:
+        msg: "Not enough disk space. Only {{ available_space.stdout }} available."
+      when: available_space.stdout | replace('G', '') | float < 1.0
+      tags:
+        - pre_check
+
     - name: Update apt package list
       apt:
         update_cache: yes
@@ -22,10 +52,15 @@
       tags:
         - update
 
-    - name: Upgrade all packages
+    - name: Upgrade all packages except excluded ones
       apt:
-        upgrade: dist
+        name: "*"
+        state: latest
+        exclude: "{{ excluded_packages | join(',') }}"
       register: apt_upgrade_result
+      failed_when:
+        - apt_upgrade_result.failed
+        - "'Failed to fetch' in apt_upgrade_result.msg"
       tags:
         - upgrade
 
@@ -42,24 +77,48 @@
       tags:
         - reboot_check
 
+    - name: Remove unnecessary packages
+      apt:
+        autoremove: yes
+      register: autoremove_result
+      tags:
+        - cleanup
+
+    - name: Clean apt cache
+      apt:
+        autoclean: yes
+      register: autoclean_result
+      tags:
+        - cleanup
+
+    - name: Log upgrade summary
+      lineinfile:
+        path: "{{ log_file }}"
+        line: "{{ ansible_date_time.iso8601 }} - Host: {{ ansible_hostname }} - Packages updated: {{ apt_update_result.changed }} - Packages upgraded: {{ apt_upgrade_result.changed }} - Reboot required: {{ reboot_required }} - Autoremove: {{ autoremove_result.changed }} - Autoclean: {{ autoclean_result.changed }}"
+        create: yes
+      tags:
+        - always
+
     - name: Print upgrade summary
       debug:
         msg:
           - "Packages updated: {{ apt_update_result.changed }}"
           - "Packages upgraded: {{ apt_upgrade_result.changed }}"
           - "Reboot required: {{ reboot_required }}"
+          - "Packages autoremoved: {{ autoremove_result.changed }}"
+          - "Apt cache cleaned: {{ autoclean_result.changed }}"
       tags:
         - always
 
-    - name: Reboot the system if required
+    - name: Reboot the system if required and allowed
       reboot:
         msg: "Rebooting due to package upgrades"
         reboot_timeout: 300
-      when: reboot_required
+      when: reboot_required and perform_reboot
       tags:
         - reboot
 
-    - name: Discord with upgrade results
+    - name: Send Discord notification
       block:
         - uri:
             url: "{{ discord_webhook_url }}"
@@ -72,10 +131,14 @@
                 Updates: {{ 'Yes' if apt_update_result.changed else 'No' }}
                 Upgrades: {{ 'Yes' if apt_upgrade_result.changed else 'No' }}
                 Reboot needed: {{ 'Yes' if reboot_required else 'No' }}
+                Reboot performed: {{ 'Yes' if (reboot_required and perform_reboot) else 'No' }}
+                Packages autoremoved: {{ 'Yes' if autoremove_result.changed else 'No' }}
+                Apt cache cleaned: {{ 'Yes' if autoclean_result.changed else 'No' }}
                 {% if apt_upgrade_result.stdout_lines | length > 0 %}
                 Upgraded packages:
                 {{ apt_upgrade_result.stdout_lines | select('match', '^Upgrading.*') | list | join('\n') }}
                 {% endif %}
+                Excluded packages: {{ excluded_packages | join(', ') }}
             status_code: [ 200, 204 ]
           register: discord_notification
           until: discord_notification is not failed
@@ -83,8 +146,10 @@
           delay: 5
       rescue:
         - name: Log failure for upgrade notification
-          debug:
-            msg: "Failed to send Discord notification about upgrades for host {{ ansible_hostname }}"
+          lineinfile:
+            path: "{{ log_file }}"
+            line: "{{ ansible_date_time.iso8601 }} - Failed to send Discord notification about upgrades for host {{ ansible_hostname }}"
+            create: yes
       always:
         - name: Ensure playbook continues after upgrade notification
           debug:
@@ -92,34 +157,6 @@
       when: discord_webhook_url is defined
       tags:
         - notify
-
-    - name: Send concise Discord notification about reboot
-      block:
-        - uri:
-            url: "{{ discord_webhook_url }}"
-            method: POST
-            body_format: json
-            body:
-              content: "Host {{ ansible_hostname }} rebooted due to package upgrades at {{ ansible_date_time.iso8601 }}"
-            status_code: [ 200, 204 ]
-          register: discord_reboot_notification
-          until: discord_reboot_notification is not failed
-          retries: 3
-          delay: 5
-      rescue:
-        - name: Log failure for reboot notification
-          debug:
-            msg: "Failed to send Discord notification about reboot for host {{ ansible_hostname }}"
-      always:
-        - name: Ensure playbook continues after reboot notification
-          debug:
-            msg: "Continuing with next tasks..."
-      when:
-        - discord_webhook_url is defined
-        - reboot_required
-      tags:
-        - notify
-        - reboot
 
   handlers:
     - name: Restart services
