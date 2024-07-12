@@ -1,0 +1,64 @@
+---
+- name: Check services status on both servers and report to Discord
+  hosts: all
+  become: yes
+  vars:
+    discord_webhook_url: "{{ lookup('env', 'DISCORD_WEBHOOK_URL') }}"
+  tasks:
+    - name: Check status of WireGuard (wg0)
+      command: systemctl is-active wg-quick@wg0.service
+      register: wg_status
+      ignore_errors: true
+      changed_when: false
+
+    - name: Check status of Fail2ban
+      command: systemctl is-active fail2ban
+      register: fail2ban_status
+      ignore_errors: true
+      changed_when: false
+
+    - name: Send status report to Discord
+      uri:
+        url: "{{ discord_webhook_url }}"
+        method: POST
+        body_format: json
+        body: >
+          {
+            "content": "Service status update from **{{ inventory_hostname }}**:\n- **WireGuard**: {{ wg_status.stdout }}\n- **Fail2ban**: {{ fail2ban_status.stdout }}"
+          }
+      delegate_to: localhost
+      become: no
+
+- name: Additional checks for rawcsec server and report to Discord
+  hosts: rawcsec
+  become: yes
+  tasks:
+    - name: Check status of Pi-hole
+      command: systemctl is-active pihole-FTL
+      register: pihole_status
+      ignore_errors: true
+      changed_when: false
+
+    - name: Check status of Unbound
+      command: systemctl is-active unbound
+      register: unbound_status
+      ignore_errors: true
+      changed_when: false
+
+    - name: Check status of Mullvad WireGuard (mullvad-us1)
+      command: systemctl is-active wg-quick@mullvad-us1.service
+      register: mullvad_status
+      ignore_errors: true
+      changed_when: false
+
+    - name: Send additional status report to Discord
+      uri:
+        url: "{{ discord_webhook_url }}"
+        method: POST
+        body_format: json
+        body: >
+          {
+            "content": "Additional service status update from **{{ inventory_hostname }}**:\n- **Pi-hole**: {{ pihole_status.stdout }}\n- **Unbound**: {{ unbound_status.stdout }}\n- **Mullvad WireGuard**: {{ mullvad_status.stdout }}"
+          }
+      delegate_to: localhost
+      become: no
