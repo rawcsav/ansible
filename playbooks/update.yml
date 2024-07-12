@@ -124,24 +124,17 @@
             url: "{{ discord_webhook_url }}"
             method: POST
             body_format: json
-            body:
-              content: |
-                Host: {{ ansible_hostname }}
-                OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
-                Updates: {{ 'Yes' if apt_update_result.changed else 'No' }}
-                Upgrades: {{ 'Yes' if apt_upgrade_result.changed else 'No' }}
-                Reboot needed: {{ 'Yes' if reboot_required else 'No' }}
-                Reboot performed: {{ 'Yes' if (reboot_required and perform_reboot) else 'No' }}
-                Packages autoremoved: {{ 'Yes' if autoremove_result.changed else 'No' }}
-                Apt cache cleaned: {{ 'Yes' if autoclean_result.changed else 'No' }}
-                {% if apt_upgrade_result.stdout_lines | length > 0 %}
-                Upgraded packages:
-                {{ apt_upgrade_result.stdout_lines | select('match', '^Upgrading.*') | list | join('\n') }}
-                {% endif %}
-                Excluded packages: {{ excluded_packages | join(', ') }}
+            headers:
+              Content-Type: "application/json"
+            body: >-
+              {
+                "content": "Host: {{ ansible_hostname }} - OS: {{ ansible_distribution }} {{ ansible_distribution_version }} - Updates: {{ 'Yes' if apt_update_result.changed else 'No' }} - Upgrades: {{ 'Yes' if apt_upgrade_result.changed else 'No' }} - Reboot needed: {{ 'Yes' if reboot_required else 'No' }} - Reboot performed: {{ 'Yes' if (reboot_required and perform_reboot) else 'No' }} - Packages autoremoved: {{ 'Yes' if autoremove_result.changed else 'No' }} - Apt cache cleaned: {{ 'Yes' if autoclean_result.changed else 'No' }}",
+                "Upgraded packages": "{{ apt_upgrade_result.stdout_lines | default([]) | select('match', '^Upgrading.*') | map('regex_replace', '.*?Upgrading (.*?) from .*', '\\1') | list | join(', ') if apt_upgrade_result.stdout_lines is defined else 'None' }}",
+                "Excluded packages": "{{ excluded_packages | join(', ') }}"
+              }
             status_code: [ 200, 204 ]
           register: discord_notification
-          until: discord_notification is not failed
+          until: discord_notification.status == 200
           retries: 3
           delay: 5
       rescue:
@@ -157,7 +150,6 @@
       when: discord_webhook_url is defined
       tags:
         - notify
-
   handlers:
     - name: Restart services
       service:
