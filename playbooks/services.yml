@@ -1,64 +1,137 @@
 ---
-- name: Check services status on both servers and report to Discord
+- name: Check services status on both servers and send email report
   hosts: all
   become: yes
   vars:
-    discord_webhook_url: "{{ lookup('env', 'DISCORD_WEBHOOK_URL') }}"
+    email_to: "{{ smtp_username }}"
+    email_from: "{{ smtp_username }}"
+    email_subject: "Service Status Update from {{ ansible_facts['hostname'] }}"
   tasks:
-    - name: Check status of WireGuard (wg0)
-      command: systemctl is-active wg-quick@wg0.service
-      register: wg_status
+    - name: Include vaulted variables
+      ansible.builtin.include_vars:
+        file: ../vault/secrets.yml
+
+    - name: Check WireGuard status and show details
+      shell: sudo wg show
+      register: wg_show
       ignore_errors: true
       changed_when: false
 
-    - name: Check status of Fail2ban
-      command: systemctl is-active fail2ban
-      register: fail2ban_status
+    - name: Tail WireGuard logs
+      shell: tail -n 10 /var/log/syslog | grep wg
+      register: wg_logs
       ignore_errors: true
       changed_when: false
 
-    - name: Send status report to Discord
-      uri:
-        url: "{{ discord_webhook_url }}"
-        method: POST
-        body_format: json
-        body: >
-          {
-            "content": "Service status update from **{{ inventory_hostname }}**:\n- **WireGuard**: {{ wg_status.stdout }}\n- **Fail2ban**: {{ fail2ban_status.stdout }}"
-          }
-      delegate_to: localhost
-      become: no
+    - name: Tail Fail2ban logs
+      shell: tail -n 10 /var/log/fail2ban.log
+      register: fail2ban_logs
+      ignore_errors: true
+      changed_when: false
 
-- name: Additional checks for rawcsec server and report to Discord
+    - name: Gather system facts
+      ansible.builtin.setup:
+
+    - name: Create email body
+      set_fact:
+        email_body: |
+          Service status update from **{{ ansible_facts['hostname'] }}** ({{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}):
+          
+          - **WireGuard Show**:
+          {{ wg_show.stdout | default('N/A') }}
+
+          - **WireGuard Logs**:
+          {{ wg_logs.stdout | default('N/A') }}
+
+          - **Fail2ban Logs**:
+          {{ fail2ban_logs.stdout | default('N/A') }}
+
+          - **Uptime**: {{ ansible_facts['uptime_seconds'] | int | seconds_to_time }}
+          
+          - **Memory**: Total {{ ansible_facts['memtotal_mb'] }} MB, Free {{ ansible_facts['memfree_mb'] }} MB
+          
+          - **Disk**: {{ ansible_facts['mounts'][0]['mount'] }} {{ ansible_facts['mounts'][0]['size_total'] | human_readable | default('N/A') }} total, {{ ansible_facts['mounts'][0]['size_available'] | human_readable | default('N/A') }} available
+
+    - name: Send status report via email
+      ansible.builtin.mail:
+        host: "{{ smtp_server }}"
+        port: "{{ smtp_port }}"
+        username: "{{ smtp_username }}"
+        password: "{{ smtp_password }}"
+        to: "{{ email_to }}"
+        from: "{{ email_from }}"
+        subject: "{{ email_subject }}"
+        body: "{{ email_body }}"
+
+- name: Additional checks for rawcsec server and send email report
   hosts: rawcsec
   become: yes
+  vars:
+    email_to: "{{ smtp_username }}"
+    email_from: "{{ smtp_username }}"
+    email_subject: "Additional Service Status Update from {{ ansible_facts['hostname'] }}"
   tasks:
+    - name: Include vaulted variables
+      ansible.builtin.include_vars:
+        file: ../vault/secrets.yml
+
     - name: Check status of Pi-hole
-      command: systemctl is-active pihole-FTL
+      shell: sudo systemctl status pihole-FTL
       register: pihole_status
       ignore_errors: true
       changed_when: false
 
+    - name: Tail Pi-hole logs
+      shell: tail -n 10 /var/log/pihole.log
+      register: pihole_logs
+      ignore_errors: true
+      changed_when: false
+
     - name: Check status of Unbound
-      command: systemctl is-active unbound
+      shell: sudo systemctl status unbound
       register: unbound_status
       ignore_errors: true
       changed_when: false
 
-    - name: Check status of Mullvad WireGuard (mullvad-us1)
-      command: systemctl is-active wg-quick@mullvad-us1.service
-      register: mullvad_status
+    - name: Tail Unbound logs
+      shell: tail -n 10 /var/log/unbound/unbound.log
+      register: unbound_logs
       ignore_errors: true
       changed_when: false
 
-    - name: Send additional status report to Discord
-      uri:
-        url: "{{ discord_webhook_url }}"
-        method: POST
-        body_format: json
-        body: >
-          {
-            "content": "Additional service status update from **{{ inventory_hostname }}**:\n- **Pi-hole**: {{ pihole_status.stdout }}\n- **Unbound**: {{ unbound_status.stdout }}\n- **Mullvad WireGuard**: {{ mullvad_status.stdout }}"
-          }
-      delegate_to: localhost
-      become: no
+    - name: Gather system facts
+      ansible.builtin.setup:
+
+    - name: Create email body
+      set_fact:
+        email_body: |
+          Additional service status update from **{{ ansible_facts['hostname'] }}** ({{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}):
+          
+          - **Pi-hole Status**:
+          {{ pihole_status.stdout | default('N/A') }}
+
+          - **Pi-hole Logs**:
+          {{ pihole_logs.stdout | default('N/A') }}
+
+          - **Unbound Status**:
+          {{ unbound_status.stdout | default('N/A') }}
+
+          - **Unbound Logs**:
+          {{ unbound_logs.stdout | default('N/A') }}
+
+          - **Uptime**: {{ ansible_facts['uptime_seconds'] | int | seconds_to_time }}
+          
+          - **Memory**: Total {{ ansible_facts['memtotal_mb'] }} MB, Free {{ ansible_facts['memfree_mb'] }} MB
+          
+          - **Disk**: {{ ansible_facts['mounts'][0]['mount'] }} {{ ansible_facts['mounts'][0]['size_total'] | human_readable | default('N/A') }} total, {{ ansible_facts['mounts'][0]['size_available'] | human_readable | default('N/A') }} available
+
+    - name: Send additional status report via email
+      ansible.builtin.mail:
+        host: "{{ smtp_server }}"
+        port: "{{ smtp_port }}"
+        username: "{{ smtp_username }}"
+        password: "{{ smtp_password }}"
+        to: "{{ email_to }}"
+        from: "{{ email_from }}"
+        subject: "{{ email_subject }}"
+        body: "{{ email_body }}"
