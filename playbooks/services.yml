@@ -1,16 +1,13 @@
----
-- name: Check services status on both servers and send email report
-  hosts: all
+- name: Check services status on all servers and send email report
+  hosts: servers
   become: yes
+  vars_files:
+    - ../group_vars/servers/vault.yml
   vars:
-    email_to: "{{ smtp_username }}"
-    email_from: "{{ smtp_username }}"
+    email_to: "{{ vault_smtp_username }}"
+    email_from: "{{ vault_smtp_username }}"
     email_subject: "Service Status Update from {{ ansible_facts['hostname'] }}"
   tasks:
-    - name: Include vaulted variables
-      ansible.builtin.include_vars:
-        file: ../vault/secrets.yml
-
     - name: Check WireGuard status and show details
       shell: sudo wg show
       register: wg_show
@@ -26,6 +23,30 @@
     - name: Tail Fail2ban logs
       shell: tail -n 10 /var/log/fail2ban.log
       register: fail2ban_logs
+      ignore_errors: true
+      changed_when: false
+
+    - name: Get CPU usage
+      shell: top -bn1 | grep "Cpu(s)" | sed "s/.*, *\([0-9.]*\)%* id.*/\1/" | awk '{print 100 - $1"%"}'
+      register: cpu_usage
+      ignore_errors: true
+      changed_when: false
+
+    - name: Get network statistics
+      shell: ip -s link
+      register: network_stats
+      ignore_errors: true
+      changed_when: false
+
+    - name: Check for failed services
+      shell: systemctl list-units --state=failed
+      register: failed_services
+      ignore_errors: true
+      changed_when: false
+
+    - name: Check for unauthorized SSH attempts
+      shell: grep "Failed password" /var/log/auth.log | tail -n 10
+      register: ssh_attempts
       ignore_errors: true
       changed_when: false
 
@@ -46,35 +67,49 @@
           - **Fail2ban Logs**:
           {{ fail2ban_logs.stdout | default('N/A') }}
 
-          - **Uptime**: {{ ansible_facts['uptime_seconds'] | int | seconds_to_time }}
+          - **CPU Usage**: {{ cpu_usage.stdout | default('N/A') }}
           
           - **Memory**: Total {{ ansible_facts['memtotal_mb'] }} MB, Free {{ ansible_facts['memfree_mb'] }} MB
           
           - **Disk**: {{ ansible_facts['mounts'][0]['mount'] }} {{ ansible_facts['mounts'][0]['size_total'] | human_readable | default('N/A') }} total, {{ ansible_facts['mounts'][0]['size_available'] | human_readable | default('N/A') }} available
 
+          - **Network Statistics**:
+          {{ network_stats.stdout | default('N/A') }}
+
+          - **Failed Services**:
+          {% if failed_services.stdout_lines | length > 0 %}
+          {{ failed_services.stdout }}
+          {% else %}
+          No failed services
+          {% endif %}
+
+          - **Recent Unauthorized SSH Attempts**:
+          {{ ssh_attempts.stdout | default('N/A') }}
+
+          - **Uptime**: {{ ansible_facts['uptime_seconds'] | int | seconds_to_time }}
+
     - name: Send status report via email
       ansible.builtin.mail:
-        host: "{{ smtp_server }}"
-        port: "{{ smtp_port }}"
-        username: "{{ smtp_username }}"
-        password: "{{ smtp_password }}"
+        host: "{{ vault_smtp_server }}"
+        port: "{{ vault_smtp_port }}"
+        username: "{{ vault_smtp_username }}"
+        password: "{{ vault_smtp_password }}"
         to: "{{ email_to }}"
         from: "{{ email_from }}"
         subject: "{{ email_subject }}"
         body: "{{ email_body }}"
 
+
 - name: Additional checks for rawcsec server and send email report
   hosts: rawcsec
   become: yes
+  vars_files:
+    - ../group_vars/servers/vault.yml
   vars:
-    email_to: "{{ smtp_username }}"
-    email_from: "{{ smtp_username }}"
-    email_subject: "Additional Service Status Update from {{ ansible_facts['hostname'] }}"
+    email_to: "{{ vault_smtp_username }}"
+    email_from: "{{ vault_smtp_username }}"
+    email_subject: "Service Status Update from {{ ansible_facts['hostname'] }}"
   tasks:
-    - name: Include vaulted variables
-      ansible.builtin.include_vars:
-        file: ../vault/secrets.yml
-
     - name: Check status of Pi-hole
       shell: sudo systemctl status pihole-FTL
       register: pihole_status
@@ -99,6 +134,18 @@
       ignore_errors: true
       changed_when: false
 
+    - name: Get Pi-hole statistics
+      shell: pihole -c -j
+      register: pihole_stats
+      ignore_errors: true
+      changed_when: false
+
+    - name: Get Unbound statistics
+      shell: unbound-control stats_noreset | head -n 10
+      register: unbound_stats
+      ignore_errors: true
+      changed_when: false
+
     - name: Gather system facts
       ansible.builtin.setup:
 
@@ -113,11 +160,17 @@
           - **Pi-hole Logs**:
           {{ pihole_logs.stdout | default('N/A') }}
 
+          - **Pi-hole Statistics**:
+          {{ pihole_stats.stdout | default('N/A') | from_json | to_nice_yaml }}
+
           - **Unbound Status**:
           {{ unbound_status.stdout | default('N/A') }}
 
           - **Unbound Logs**:
           {{ unbound_logs.stdout | default('N/A') }}
+
+          - **Unbound Statistics**:
+          {{ unbound_stats.stdout | default('N/A') }}
 
           - **Uptime**: {{ ansible_facts['uptime_seconds'] | int | seconds_to_time }}
           
@@ -125,12 +178,12 @@
           
           - **Disk**: {{ ansible_facts['mounts'][0]['mount'] }} {{ ansible_facts['mounts'][0]['size_total'] | human_readable | default('N/A') }} total, {{ ansible_facts['mounts'][0]['size_available'] | human_readable | default('N/A') }} available
 
-    - name: Send additional status report via email
+    - name: Send status report via email
       ansible.builtin.mail:
-        host: "{{ smtp_server }}"
-        port: "{{ smtp_port }}"
-        username: "{{ smtp_username }}"
-        password: "{{ smtp_password }}"
+        host: "{{ vault_smtp_server }}"
+        port: "{{ vault_smtp_port }}"
+        username: "{{ vault_smtp_username }}"
+        password: "{{ vault_smtp_password }}"
         to: "{{ email_to }}"
         from: "{{ email_from }}"
         subject: "{{ email_subject }}"
