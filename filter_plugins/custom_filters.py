@@ -1,5 +1,4 @@
 # filter_plugins/custom_filters.py
-
 def seconds_to_time(seconds):
     m, s = divmod(seconds, 60)
     h, m = divmod(m, 60)

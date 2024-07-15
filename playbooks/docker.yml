@@ -16,49 +16,65 @@
     email_to: "{{ vault_smtp_username }}"
     email_from: "{{ vault_smtp_username }}"
     email_subject: "Docker Compose Update Report from {{ ansible_facts['hostname'] }}"
+    force_update: true  # Set to true to force updates for testing
   tasks:
-    - name: Gather system facts
-      ansible.builtin.setup:
+    - name: Pull latest updates from GitHub
+      ansible.builtin.git:
+        repo: "{{ item.repo }}"
+        dest: "{{ item.path }}"
+        force: yes
+        update: yes
+      register: git_status
+      loop: "{{ docker_compose_projects }}"
 
-    - name: Get current Docker info
-      community.docker.docker_host_info:
-      register: docker_info
-
-    - name: Get list of running containers before update
-      community.docker.docker_container_info:
-        name: all
-      register: container_info_before
-
-    - name: Pull updates and manage Docker Compose projects
+    - name: Manage Docker Compose projects
       block:
-        - name: Pull latest updates from GitHub
-          ansible.builtin.git:
-            repo: "{{ item.repo }}"
-            dest: "{{ item.path }}"
-            force: yes
-          register: git_status
-          loop: "{{ docker_compose_projects }}"
-
-        - name: Restart Docker Compose project if updated
-          community.docker.docker_compose_v2:
-            project_src: "{{ item.item.path }}"
-            state: present
-            build: "{{ 'always' if item.changed else 'never' }}"
-            pull: always
-            recreate: always
-          when: item.changed
+        - name: Capture 'before' state for projects
+          ansible.builtin.command:
+            cmd: docker compose ps
+            chdir: "{{ item.item.path }}"
+          register: before_state
           loop: "{{ git_status.results }}"
           loop_control:
             label: "{{ item.item.path }}"
-          register: docker_restart_result
 
-        - name: Remove old Docker images and volumes
-          community.docker.docker_prune:
-            images: yes
-            volumes: yes
-            images_filters:
-              dangling: true
-          register: prune_result
+        - name: Stop Docker Compose project if updated or forced
+          ansible.builtin.command:
+            cmd: docker compose down
+            chdir: "{{ item.item.path }}"
+          when: item.changed or (item.item.path == '/home/rawcsav/SpotifyFlask' and force_update | bool)
+          loop: "{{ git_status.results }}"
+          loop_control:
+            label: "{{ item.item.path }}"
+          register: down_result
+
+        - name: Start Docker Compose project if updated or forced
+          ansible.builtin.command:
+            cmd: docker compose up -d
+            chdir: "{{ item.item.path }}"
+          when: item.changed or (item.item.path == '/home/rawcsav/SpotifyFlask' and force_update | bool)
+          loop: "{{ git_status.results }}"
+          loop_control:
+            label: "{{ item.item.path }}"
+          register: up_result
+
+        - name: Capture 'after' state for projects
+          ansible.builtin.command:
+            cmd: docker compose ps
+            chdir: "{{ item.item.path }}"
+          register: after_state
+          loop: "{{ git_status.results }}"
+          loop_control:
+            label: "{{ item.item.path }}"
+
+        - name: Capture recent logs for projects
+          ansible.builtin.command:
+            cmd: docker compose logs --tail=20
+            chdir: "{{ item.item.path }}"
+          register: recent_logs
+          loop: "{{ git_status.results }}"
+          loop_control:
+            label: "{{ item.item.path }}"
 
       rescue:
         - name: Capture error details
@@ -66,55 +82,26 @@
             error_details: "{{ ansible_failed_result }}"
 
       always:
-        - name: Get list of running containers after update
-          community.docker.docker_container_info:
-            name: all
-          register: container_info_after
         - name: Prepare status report
           ansible.builtin.set_fact:
             status_report: |
-              Docker Compose Update Report for {{ ansible_facts['hostname'] }}
+              Docker Compose Update Report for {{ ansible_hostname }}
 
-              System Information:
-              - OS: {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}
-
-              - Kernel: {{ ansible_facts['kernel'] }}
-              - Total Memory: {{ ansible_facts['memtotal_mb'] }} MB
-              - Available Memory: {{ ansible_facts['memfree_mb'] }} MB
-              - CPU Count: {{ ansible_facts['processor_count'] }}
-
-              Docker Compose Projects:
               {% for result in git_status.results %}
-              - Project: {{ result.item.path }}
-                - Repository: {{ result.item.repo }}
-                - Updated: {{ 'Yes' if result.changed else 'No' }}
-                {% if docker_restart_result.results is defined %}
-                {% set restart_result = docker_restart_result.results | selectattr('item.item.path', 'equalto', result.item.path) | first %}
-                - Restarted: {{ 'Yes' if restart_result.changed | default(false) else 'No' }}
-                {% endif %}
-              {% endfor %}
+              Project: {{ result.item.path }}
+              Repository: {{ result.item.repo }}
+              Updated: {{ 'Yes' if result.changed or (result.item.path == '/home/rawcsav/SpotifyFlask' and force_update) else 'No' }}
 
-              Docker Containers:
-              - Before Update:
-              {% if container_info_before.containers is defined %}
-              {% for container in container_info_before.containers.values() %}
-                - {{ container.name }}: {{ container.state.status }}
-              {% endfor %}
-              {% else %}
-                No containers found.
-              {% endif %}
-              - After Update:
-              {% if container_info_after.containers is defined %}
-              {% for container in container_info_after.containers.values() %}
-                - {{ container.name }}: {{ container.state.status }}
-              {% endfor %}
-              {% else %}
-                No containers found.
-              {% endif %}
+              Before Update:
+              {{ before_state.results[loop.index0].stdout }}
 
-              Docker Prune Results:
-              - Images Removed: {{ prune_result.images_deleted | default(0) }}
-              - Space Reclaimed: {{ prune_result.space_reclaimed | default(0) | human_readable }}
+              After Update:
+              {{ after_state.results[loop.index0].stdout }}
+
+              Recent Logs:
+              {{ recent_logs.results[loop.index0].stdout }}
+
+              {% endfor %}
 
               {% if error_details is defined %}
               Error Details:
