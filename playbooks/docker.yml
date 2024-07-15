@@ -70,7 +70,6 @@
           community.docker.docker_container_info:
             name: all
           register: container_info_after
-
         - name: Prepare status report
           ansible.builtin.set_fact:
             status_report: |
