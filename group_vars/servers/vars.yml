@@ -1,0 +1,6 @@
+# group_vars/servers/vars.yml
+smtp_server: "{{ vault_smtp_server }}"
+smtp_port: "{{ vault_smtp_port }}"
+smtp_username: "{{ vault_smtp_username }}"
+smtp_password: "{{ vault_smtp_password }}"
+smtp_use_tls: "{{ vault_smtp_use_tls }}"

@@ -1,56 +1,39 @@
----
-- name: Update and Upgrade all packages
+- name: Update, Upgrade, and Report on Debian-based Systems
   hosts: all
   become: yes
+  vars_files:
+    - ../group_vars/servers/vault.yml
   vars:
-    reboot_required: false
-    perform_reboot: false  # Set to true to allow automatic reboots
-    discord_webhook_url: "{{ lookup('env', 'DISCORD_WEBHOOK_URL') }}"
-    log_file: "/var/log/ansible_upgrade.log"
+    perform_reboot: true  # Set to true to allow automatic reboots
     excluded_packages:
-      - docker
-      - docker-ce
       - wireguard
       - pihole
       - unbound
+    email_to: "{{ vault_smtp_username }}"
+    email_from: "{{ vault_smtp_username }}"
+    email_subject: "System Update Report for {{ ansible_hostname }}"
 
   tasks:
     - name: Check if system is Debian-based
       fail:
         msg: "This playbook only supports Debian-based systems"
       when: ansible_os_family != "Debian"
-      tags:
-        - always
-
-    - name: Ensure log directory exists
-      file:
-        path: "{{ log_file | dirname }}"
-        state: directory
-        mode: '0755'
-      tags:
-        - always
 
     - name: Check available disk space
       shell: df -h / | awk 'NR==2 {print $4}'
       register: available_space
       changed_when: false
-      tags:
-        - pre_check
 
     - name: Fail if not enough disk space
       fail:
         msg: "Not enough disk space. Only {{ available_space.stdout }} available."
       when: available_space.stdout | replace('G', '') | float < 1.0
-      tags:
-        - pre_check
 
     - name: Update apt package list
       apt:
         update_cache: yes
         cache_valid_time: 3600
       register: apt_update_result
-      tags:
-        - update
 
     - name: Upgrade all packages except excluded ones
       apt:
@@ -61,95 +44,112 @@
       failed_when:
         - apt_upgrade_result.failed
         - "'Failed to fetch' in apt_upgrade_result.msg"
-      tags:
-        - upgrade
 
     - name: Check if a reboot is required
       stat:
         path: /var/run/reboot-required
       register: reboot_required_file
-      tags:
-        - reboot_check
 
     - name: Set reboot_required flag
       set_fact:
         reboot_required: "{{ reboot_required_file.stat.exists }}"
-      tags:
-        - reboot_check
 
     - name: Remove unnecessary packages
       apt:
         autoremove: yes
       register: autoremove_result
-      tags:
-        - cleanup
 
     - name: Clean apt cache
       apt:
         autoclean: yes
       register: autoclean_result
-      tags:
-        - cleanup
 
-    - name: Log upgrade summary
-      lineinfile:
-        path: "{{ log_file }}"
-        line: "{{ ansible_date_time.iso8601 }} - Host: {{ ansible_hostname }} - Packages updated: {{ apt_update_result.changed }} - Packages upgraded: {{ apt_upgrade_result.changed }} - Reboot required: {{ reboot_required }} - Autoremove: {{ autoremove_result.changed }} - Autoclean: {{ autoclean_result.changed }}"
-        create: yes
-      tags:
-        - always
+    - name: Get list of upgraded packages
+      set_fact:
+        upgraded_packages: "{{ apt_upgrade_result.stdout_lines | default([]) | select('match', '^Upgrading.*') | map('regex_replace', '.*?Upgrading (.*?) from .*', '\\1') | list }}"
 
-    - name: Print upgrade summary
-      debug:
-        msg:
-          - "Packages updated: {{ apt_update_result.changed }}"
-          - "Packages upgraded: {{ apt_upgrade_result.changed }}"
-          - "Reboot required: {{ reboot_required }}"
-          - "Packages autoremoved: {{ autoremove_result.changed }}"
-          - "Apt cache cleaned: {{ autoclean_result.changed }}"
-      tags:
-        - always
+    - name: Get CPU usage
+      shell: top -bn1 | grep "Cpu(s)" | sed "s/.*, *\([0-9.]*\)%* id.*/\1/" | awk '{print 100 - $1"%"}'
+      register: cpu_usage
+      changed_when: false
+
+    - name: Get network statistics
+      shell: ip -s link
+      register: network_stats
+      changed_when: false
+
+    - name: Check for failed services
+      shell: systemctl list-units --state=failed
+      register: failed_services
+      changed_when: false
+
+    - name: Check for unauthorized SSH attempts
+      shell: grep "Failed password" /var/log/auth.log | tail -n 10
+      register: ssh_attempts
+      changed_when: false
+
+    - name: Gather system facts
+      ansible.builtin.setup:
+
+    - name: Create email body
+      set_fact:
+        email_body: |
+          System update report for **{{ ansible_hostname }}** ({{ ansible_distribution }} {{ ansible_distribution_version }}):
+
+          - **Update Summary**:
+            - Packages updated: {{ apt_update_result.changed }}
+            - Packages upgraded: {{ apt_upgrade_result.changed }}
+            - Packages autoremoved: {{ autoremove_result.changed }}
+            - Apt cache cleaned: {{ autoclean_result.changed }}
+            - Reboot required: {{ reboot_required }}
+            - Reboot performed: {{ 'Yes' if (reboot_required and perform_reboot) else 'No' }}
+
+          - **Upgraded Packages**:
+            {% if upgraded_packages | length > 0 %}
+            {{ upgraded_packages | join(', ') }}
+            {% else %}
+            None
+            {% endif %}
+
+          - **Excluded Packages**:
+            {{ excluded_packages | join(', ') }}
+
+          - **System Information**:
+            - CPU Usage: {{ cpu_usage.stdout | default('N/A') }}
+            - Memory: Total {{ ansible_facts['memtotal_mb'] }} MB, Free {{ ansible_facts['memfree_mb'] }} MB
+            - Disk: {{ ansible_facts['mounts'][0]['mount'] }} {{ ansible_facts['mounts'][0]['size_total'] | human_readable }} total, {{ ansible_facts['mounts'][0]['size_available'] | human_readable }} available
+            - Uptime: {{ ansible_facts['uptime_seconds'] | int | seconds_to_time }}
+
+          - **Network Statistics**:
+          {{ network_stats.stdout | default('N/A') }}
+
+          - **Failed Services**:
+          {% if failed_services.stdout_lines | length > 0 %}
+          {{ failed_services.stdout }}
+          {% else %}
+          No failed services
+          {% endif %}
+
+          - **Recent Unauthorized SSH Attempts**:
+          {{ ssh_attempts.stdout | default('N/A') }}
+
+    - name: Send status report via email
+      ansible.builtin.mail:
+        host: "{{ vault_smtp_server }}"
+        port: "{{ vault_smtp_port }}"
+        username: "{{ vault_smtp_username }}"
+        password: "{{ vault_smtp_password }}"
+        to: "{{ email_to }}"
+        from: "{{ email_from }}"
+        subject: "{{ email_subject }}"
+        body: "{{ email_body }}"
 
     - name: Reboot the system if required and allowed
       reboot:
         msg: "Rebooting due to package upgrades"
         reboot_timeout: 300
       when: reboot_required and perform_reboot
-      tags:
-        - reboot
 
-    - name: Send Discord notification
-      block:
-        - uri:
-            url: "{{ discord_webhook_url }}"
-            method: POST
-            body_format: json
-            headers:
-              Content-Type: "application/json"
-            body: >-
-              {
-                "content": "Host: {{ ansible_hostname }} - OS: {{ ansible_distribution }} {{ ansible_distribution_version }} - Updates: {{ 'Yes' if apt_update_result.changed else 'No' }} - Upgrades: {{ 'Yes' if apt_upgrade_result.changed else 'No' }} - Reboot needed: {{ 'Yes' if reboot_required else 'No' }} - Reboot performed: {{ 'Yes' if (reboot_required and perform_reboot) else 'No' }} - Packages autoremoved: {{ 'Yes' if autoremove_result.changed else 'No' }} - Apt cache cleaned: {{ 'Yes' if autoclean_result.changed else 'No' }}",
-                "Upgraded packages": "{{ apt_upgrade_result.stdout_lines | default([]) | select('match', '^Upgrading.*') | map('regex_replace', '.*?Upgrading (.*?) from .*', '\\1') | list | join(', ') if apt_upgrade_result.stdout_lines is defined else 'None' }}",
-                "Excluded packages": "{{ excluded_packages | join(', ') }}"
-              }
-            status_code: [ 200, 204 ]
-          register: discord_notification
-          until: discord_notification.status == 200
-          retries: 3
-          delay: 5
-      rescue:
-        - name: Log failure for upgrade notification
-          lineinfile:
-            path: "{{ log_file }}"
-            line: "{{ ansible_date_time.iso8601 }} - Failed to send Discord notification about upgrades for host {{ ansible_hostname }}"
-            create: yes
-      always:
-        - name: Ensure playbook continues after upgrade notification
-          debug:
-            msg: "Continuing with next tasks..."
-      when: discord_webhook_url is defined
-      tags:
-        - notify
   handlers:
     - name: Restart services
       service:
